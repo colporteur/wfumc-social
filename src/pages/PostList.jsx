@@ -1,7 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Link, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { supabase, withTimeout } from '../lib/supabase';
 import { publicPostImageUrl } from '../lib/postImages';
+import {
+  createPostFromSubmission,
+  createPostFromMergedSubmissions,
+} from '../lib/submissions';
+import SubmissionsBoard from '../components/SubmissionsBoard.jsx';
 import LoadingSpinner from '../components/LoadingSpinner.jsx';
 import { useAuth } from '../contexts/AuthContext.jsx';
 
@@ -53,6 +58,7 @@ function fmtDate(yyyymmdd) {
 
 export default function PostList() {
   const { user } = useAuth();
+  const navigate = useNavigate();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [posts, setPosts] = useState([]);
@@ -148,6 +154,11 @@ export default function PostList() {
           <p className="text-sm text-red-700">{error}</p>
         </div>
       )}
+
+      <LatestBulletinSubmissions
+        userId={user?.id}
+        navigate={navigate}
+      />
 
       <div className="card space-y-3">
         <div>
@@ -292,6 +303,152 @@ export default function PostList() {
           })}
         </ul>
       )}
+    </div>
+  );
+}
+
+// Dashboard panel: latest published bulletin's worshipper submissions.
+// Surfaces incoming submissions immediately so the social media team
+// doesn't have to remember to go look. Reuses SubmissionsBoard for
+// the create-one and merge-many actions.
+function LatestBulletinSubmissions({ userId, navigate }) {
+  const [loading, setLoading] = useState(true);
+  const [bulletin, setBulletin] = useState(null);
+  const [submissions, setSubmissions] = useState([]);
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (!userId) return;
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        // Most recent published bulletin.
+        const { data: bln, error: blnErr } = await withTimeout(
+          supabase
+            .from('bulletins')
+            .select('id, service_date, sunday_designation, status')
+            .eq('status', 'published')
+            .order('service_date', { ascending: false })
+            .limit(1)
+            .maybeSingle()
+        );
+        if (blnErr) throw blnErr;
+        if (cancelled) return;
+        if (!bln) {
+          setBulletin(null);
+          setSubmissions([]);
+          return;
+        }
+        setBulletin(bln);
+        const { data: subs, error: subErr } = await withTimeout(
+          supabase
+            .from('responses')
+            .select(
+              'id, is_anonymous, submitter_name, response_text, caption, image_url, highlighted_text, source_label, used_in_social_media, submitted_at'
+            )
+            .eq('bulletin_id', bln.id)
+            .order('submitted_at', { ascending: false })
+        );
+        if (subErr) throw subErr;
+        if (!cancelled) setSubmissions(subs ?? []);
+      } catch (e) {
+        if (!cancelled) setError(e.message || String(e));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [userId]);
+
+  const handleCreateOne = async (sub) => {
+    if (!userId) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const created = await createPostFromSubmission({
+        userId,
+        bulletin,
+        submission: sub,
+      });
+      navigate(`/posts/${created.id}`);
+    } catch (e) {
+      setError(e.message || String(e));
+      setBusy(false);
+    }
+  };
+
+  const handleMerge = async (subs) => {
+    if (!userId) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const created = await createPostFromMergedSubmissions({
+        userId,
+        bulletin,
+        submissions: subs,
+      });
+      navigate(`/posts/${created.id}`);
+    } catch (e) {
+      setError(e.message || String(e));
+      setBusy(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="card text-sm text-gray-500">
+        Loading latest bulletin submissions…
+      </div>
+    );
+  }
+  if (!bulletin) {
+    return null;
+  }
+
+  const unusedCount = submissions.filter((s) => !s.used_in_social_media)
+    .length;
+
+  return (
+    <div className="card border-umc-200 bg-umc-50/30">
+      <div className="flex items-baseline justify-between gap-3 flex-wrap">
+        <div>
+          <h2 className="font-serif text-lg text-umc-900">
+            Latest bulletin: {bulletin.sunday_designation || bulletin.service_date}
+          </h2>
+          <p className="text-xs text-gray-500 mt-0.5">
+            {submissions.length} submission
+            {submissions.length === 1 ? '' : 's'}
+            {unusedCount > 0 && (
+              <>
+                {' · '}
+                <span className="text-umc-700 font-medium">
+                  {unusedCount} unused
+                </span>
+              </>
+            )}
+          </p>
+        </div>
+        <p className="text-xs text-gray-500">
+          {bulletin.service_date}
+        </p>
+      </div>
+      {error && (
+        <p className="text-sm text-red-600 mt-2">{error}</p>
+      )}
+      <div className="mt-3">
+        <SubmissionsBoard
+          submissions={submissions}
+          onCreateOne={handleCreateOne}
+          onMerge={handleMerge}
+          busy={busy}
+          compactHeader
+        />
+      </div>
     </div>
   );
 }

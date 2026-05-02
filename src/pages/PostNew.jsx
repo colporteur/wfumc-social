@@ -7,6 +7,11 @@ import {
   draftFromSermon,
 } from '../lib/claude';
 import { uploadPostImage } from '../lib/postImages';
+import {
+  createPostFromSubmission,
+  createPostFromMergedSubmissions,
+} from '../lib/submissions';
+import SubmissionsBoard from '../components/SubmissionsBoard.jsx';
 import LoadingSpinner from '../components/LoadingSpinner.jsx';
 import { useAuth } from '../contexts/AuthContext.jsx';
 
@@ -34,6 +39,12 @@ const SOURCES = [
     label: 'From image',
     icon: '📷',
     blurb: 'Upload one or more images; Claude vision drafts post copy.',
+  },
+  {
+    value: 'announcement',
+    label: 'From announcement / event',
+    icon: '📅',
+    blurb: 'Promote an upcoming event or a bulletin announcement. Pulls from calendar events and bulletins (drafts included).',
   },
 ];
 
@@ -83,6 +94,13 @@ export default function PostNew() {
       )}
       {source === 'image_upload' && (
         <ImageFlow user={user} navigate={navigate} onBack={() => setSource(null)} />
+      )}
+      {source === 'announcement' && (
+        <AnnouncementFlow
+          user={user}
+          navigate={navigate}
+          onBack={() => setSource(null)}
+        />
       )}
     </div>
   );
@@ -311,7 +329,6 @@ function SubmissionsFlow({ user, navigate, onBack }) {
   const [loadingSubs, setLoadingSubs] = useState(false);
   const [submissions, setSubmissions] = useState([]);
   const [error, setError] = useState(null);
-  const [chosenSub, setChosenSub] = useState(null); // → composer
   const [busy, setBusy] = useState(false);
 
   // Load recent bulletins. Show ALL bulletins (not just those with a
@@ -322,18 +339,41 @@ function SubmissionsFlow({ user, navigate, onBack }) {
     (async () => {
       setLoadingBulletins(true);
       try {
-        const { data, error: err } = await withTimeout(
-          supabase
-            .from('bulletins')
-            .select(
-              'id, service_date, sunday_designation, status, response_prompt'
-            )
-            .order('service_date', { ascending: false })
-            .limit(30)
-        );
-        if (err) throw err;
+        // Fetch recent bulletins + each one's response prompts in
+        // parallel. Prompts moved out of bulletins.response_prompt into
+        // the response_prompts table in migration 0026.
+        const [blnRes, prRes] = await Promise.all([
+          withTimeout(
+            supabase
+              .from('bulletins')
+              .select('id, service_date, sunday_designation, status')
+              .order('service_date', { ascending: false })
+              .limit(30)
+          ),
+          withTimeout(
+            supabase
+              .from('response_prompts')
+              .select('id, bulletin_id, text, sort_order')
+              .order('sort_order', { ascending: true })
+          ),
+        ]);
+        if (blnRes.error) throw blnRes.error;
+        if (prRes.error) throw prRes.error;
         if (cancelled) return;
-        setBulletins(data ?? []);
+        // Attach the prompts to each bulletin so we can show them as
+        // context when a bulletin is picked.
+        const promptsByBulletin = new Map();
+        for (const p of prRes.data ?? []) {
+          if (!promptsByBulletin.has(p.bulletin_id)) {
+            promptsByBulletin.set(p.bulletin_id, []);
+          }
+          promptsByBulletin.get(p.bulletin_id).push(p);
+        }
+        const enriched = (blnRes.data ?? []).map((b) => ({
+          ...b,
+          prompts: promptsByBulletin.get(b.id) ?? [],
+        }));
+        setBulletins(enriched);
       } catch (e) {
         if (!cancelled) setError(e.message || String(e));
       } finally {
@@ -379,44 +419,41 @@ function SubmissionsFlow({ user, navigate, onBack }) {
     };
   }, [picked]);
 
-  if (chosenSub) {
-    // Build composer initial values from the submission.
-    const sub = chosenSub;
-    const attribution = sub.is_anonymous
-      ? 'Submitted anonymously'
-      : sub.submitter_name
-        ? `Submitted by ${sub.submitter_name}`
-        : 'Submitted by a worshipper';
-    let initialBody = '';
-    if (sub.highlighted_text) {
-      // Highlight: lead with the snippet, follow with optional commentary.
-      initialBody = `"${sub.highlighted_text}"`;
-      if (sub.source_label) initialBody += `\n— from ${sub.source_label}`;
-      if (sub.response_text) {
-        initialBody += `\n\n${sub.response_text}`;
-      }
-    } else if (sub.response_text) {
-      initialBody = sub.response_text;
-    } else if (sub.caption) {
-      initialBody = sub.caption;
+  // Single-submission → create + navigate via shared helper.
+  const handleCreateOne = async (sub) => {
+    if (!user?.id) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const created = await createPostFromSubmission({
+        userId: user.id,
+        bulletin: picked,
+        submission: sub,
+      });
+      navigate(`/posts/${created.id}`);
+    } catch (e) {
+      setError(e.message || String(e));
+      setBusy(false);
     }
-    const initialTitle = `${picked.sunday_designation || picked.service_date} · ${attribution}`;
+  };
 
-    return (
-      <SubmissionComposer
-        user={user}
-        navigate={navigate}
-        initialTitle={initialTitle}
-        initialBody={initialBody}
-        sourceBulletinId={picked.id}
-        responseId={sub.id}
-        existingImageUrl={sub.image_url}
-        onBack={() => setChosenSub(null)}
-        busy={busy}
-        setBusy={setBusy}
-      />
-    );
-  }
+  // Merge multiple → create + navigate.
+  const handleMerge = async (subs) => {
+    if (!user?.id) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const created = await createPostFromMergedSubmissions({
+        userId: user.id,
+        bulletin: picked,
+        submissions: subs,
+      });
+      navigate(`/posts/${created.id}`);
+    } catch (e) {
+      setError(e.message || String(e));
+      setBusy(false);
+    }
+  };
 
   if (loadingBulletins) return <LoadingSpinner label="Loading bulletins…" />;
 
@@ -458,290 +495,38 @@ function SubmissionsFlow({ user, navigate, onBack }) {
             </select>
           </div>
 
-          {picked?.response_prompt && (
-            <div className="bg-gray-50 border border-gray-200 rounded p-3">
-              <p className="text-xs uppercase tracking-wide text-gray-500 mb-1">
-                This week's prompt
+          {picked?.prompts?.length > 0 && (
+            <div className="bg-gray-50 border border-gray-200 rounded p-3 space-y-2">
+              <p className="text-xs uppercase tracking-wide text-gray-500">
+                Prompts on this bulletin ({picked.prompts.length})
               </p>
-              <p className="text-sm italic text-gray-700 whitespace-pre-wrap">
-                "{picked.response_prompt}"
-              </p>
+              {picked.prompts.map((p) => (
+                <p
+                  key={p.id}
+                  className="text-sm italic text-gray-700 whitespace-pre-wrap"
+                >
+                  "{p.text}"
+                </p>
+              ))}
             </div>
           )}
 
           {error && <p className="text-sm text-red-600">{error}</p>}
 
           {picked && (
-            <SubmissionsList
-              loading={loadingSubs}
-              submissions={submissions}
-              onPick={setChosenSub}
-            />
+            loadingSubs ? (
+              <LoadingSpinner label="Loading submissions…" />
+            ) : (
+              <SubmissionsBoard
+                submissions={submissions}
+                onCreateOne={handleCreateOne}
+                onMerge={handleMerge}
+                busy={busy}
+              />
+            )
           )}
         </>
       )}
-    </div>
-  );
-}
-
-function SubmissionsList({ loading, submissions, onPick }) {
-  if (loading) return <LoadingSpinner label="Loading submissions…" />;
-  if (submissions.length === 0) {
-    return (
-      <p className="text-sm text-gray-500 text-center py-6">
-        No submissions for this bulletin yet.
-      </p>
-    );
-  }
-  return (
-    <ul className="space-y-2">
-      {submissions.map((s) => {
-        const kind = s.highlighted_text
-          ? 'highlight'
-          : s.image_url
-            ? 'photo'
-            : 'response';
-        const KIND_BADGE = {
-          highlight: { label: 'Highlight', cls: 'bg-amber-100 text-amber-800' },
-          photo: { label: 'Photo', cls: 'bg-pink-100 text-pink-800' },
-          response: { label: 'Response', cls: 'bg-blue-100 text-blue-800' },
-        };
-        const badge = KIND_BADGE[kind];
-        const who = s.is_anonymous
-          ? 'Anonymous'
-          : s.submitter_name || 'Unnamed';
-        return (
-          <li key={s.id}>
-            <button
-              type="button"
-              onClick={() => onPick(s)}
-              className="w-full text-left card hover:border-umc-700 transition-colors p-3"
-            >
-              <div className="flex items-baseline gap-2 flex-wrap">
-                <span
-                  className={`px-2 py-0.5 text-[10px] uppercase tracking-wide rounded ${badge.cls}`}
-                >
-                  {badge.label}
-                </span>
-                <span className="text-xs text-gray-500">— {who}</span>
-                {s.used_in_social_media && (
-                  <span className="text-[10px] uppercase tracking-wide text-green-700">
-                    used
-                  </span>
-                )}
-                <span className="text-[10px] text-gray-400 ml-auto">
-                  {new Date(s.submitted_at).toLocaleDateString()}
-                </span>
-              </div>
-              <div className="mt-2 flex gap-3">
-                {s.image_url && (
-                  <img
-                    src={s.image_url}
-                    alt=""
-                    loading="lazy"
-                    className="h-16 w-16 object-cover rounded shrink-0 bg-gray-100"
-                  />
-                )}
-                <div className="min-w-0 flex-1 space-y-1">
-                  {s.highlighted_text && (
-                    <p className="text-sm italic text-gray-800 line-clamp-3 border-l-2 border-umc-300 pl-2">
-                      "{s.highlighted_text}"
-                    </p>
-                  )}
-                  {s.source_label && s.highlighted_text && (
-                    <p className="text-[10px] text-gray-500">
-                      from {s.source_label}
-                    </p>
-                  )}
-                  {s.response_text && (
-                    <p className="text-sm text-gray-700 line-clamp-3 whitespace-pre-wrap">
-                      {s.response_text}
-                    </p>
-                  )}
-                  {s.caption && !s.response_text && (
-                    <p className="text-sm text-gray-700 line-clamp-2">
-                      {s.caption}
-                    </p>
-                  )}
-                </div>
-              </div>
-            </button>
-          </li>
-        );
-      })}
-    </ul>
-  );
-}
-
-// Variant of Composer that, on save, also marks the source response
-// as used_in_social_media. Optionally seeds the post's image from the
-// worshipper's uploaded photo (downloads + re-uploads to social bucket
-// so the post owns its own copy).
-function SubmissionComposer({
-  user,
-  navigate,
-  initialTitle,
-  initialBody,
-  sourceBulletinId,
-  responseId,
-  existingImageUrl,
-  onBack,
-  busy,
-  setBusy,
-}) {
-  const [title, setTitle] = useState(initialTitle || '');
-  const [body, setBody] = useState(initialBody || '');
-  const [keepImage, setKeepImage] = useState(!!existingImageUrl);
-  const [error, setError] = useState(null);
-
-  const save = async () => {
-    if (!user?.id) return;
-    if (!body.trim()) {
-      setError('Add some post text before saving.');
-      return;
-    }
-    setBusy(true);
-    setError(null);
-    try {
-      // Insert the post first — image attach is a follow-up update so
-      // we have the post id for the storage path.
-      const { data: created, error: err } = await withTimeout(
-        supabase
-          .from('social_posts')
-          .insert({
-            owner_user_id: user.id,
-            status: 'draft',
-            title: title.trim() || null,
-            body: body.trim(),
-            source_type: 'response_prompt',
-            source_bulletin_id: sourceBulletinId,
-          })
-          .select()
-          .single()
-      );
-      if (err) throw err;
-
-      // Bring the worshipper's photo over to the post.
-      if (keepImage && existingImageUrl) {
-        try {
-          const res = await fetch(existingImageUrl);
-          if (res.ok) {
-            const blob = await res.blob();
-            const ext =
-              (blob.type.split('/')[1] || 'jpg').replace('jpeg', 'jpg');
-            const path = `${user.id}/${created.id}/${Date.now()}.${ext}`;
-            const { error: upErr } = await supabase.storage
-              .from('social-images')
-              .upload(path, blob, {
-                cacheControl: '3600',
-                upsert: false,
-                contentType: blob.type || `image/${ext}`,
-              });
-            if (!upErr) {
-              await supabase
-                .from('social_posts')
-                .update({ image_path: path })
-                .eq('id', created.id);
-            }
-          }
-        } catch (imgErr) {
-          // Non-fatal: post still saves without image.
-          // eslint-disable-next-line no-console
-          console.warn('Failed to copy submission image:', imgErr);
-        }
-      }
-
-      // Mark the source submission as used.
-      try {
-        await supabase
-          .from('responses')
-          .update({ used_in_social_media: true })
-          .eq('id', responseId);
-      } catch (markErr) {
-        // eslint-disable-next-line no-console
-        console.warn('Failed to mark response used:', markErr);
-      }
-
-      navigate(`/posts/${created.id}`);
-    } catch (e) {
-      setError(e.message || String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <div className="card space-y-3">
-      <div className="flex items-center justify-between">
-        <h2 className="font-serif text-lg text-umc-900">Composer</h2>
-        <button
-          type="button"
-          onClick={onBack}
-          className="text-xs text-gray-500 hover:text-gray-700 underline"
-        >
-          ← Back to submissions
-        </button>
-      </div>
-      <div>
-        <label className="label">Title (internal)</label>
-        <input
-          type="text"
-          className="input"
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-        />
-      </div>
-      <div>
-        <label className="label">Post text *</label>
-        <textarea
-          className="input min-h-[200px] font-mono text-sm"
-          value={body}
-          onChange={(e) => setBody(e.target.value)}
-        />
-      </div>
-      {existingImageUrl && (
-        <div className="border border-gray-200 rounded p-3 bg-gray-50">
-          <div className="flex items-start gap-3">
-            <img
-              src={existingImageUrl}
-              alt=""
-              className="h-24 w-24 object-cover rounded shrink-0"
-            />
-            <div className="flex-1">
-              <p className="text-xs text-gray-600 mb-2">
-                The worshipper attached this photo. Keep it on your post?
-              </p>
-              <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={keepImage}
-                  onChange={(e) => setKeepImage(e.target.checked)}
-                  className="h-4 w-4 rounded border-gray-300 text-umc-700"
-                />
-                Use this photo
-              </label>
-            </div>
-          </div>
-        </div>
-      )}
-      {error && (
-        <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded px-3 py-2">
-          {error}
-        </p>
-      )}
-      <div className="flex gap-2">
-        <button
-          type="button"
-          onClick={save}
-          disabled={busy}
-          className="btn-primary disabled:opacity-50"
-        >
-          {busy ? 'Saving…' : 'Save as draft'}
-        </button>
-        <Link to="/" className="btn-secondary">
-          Cancel
-        </Link>
-      </div>
     </div>
   );
 }
@@ -1044,6 +829,431 @@ function ImageFlow({ user, navigate, onBack }) {
           {drafting ? 'Drafting…' : '✨ Draft with Claude'}
         </button>
       </div>
+    </div>
+  );
+}
+
+// =====================================================================
+// Announcement / event flow.
+// Pulls upcoming calendar events + announcements + image_flyer blocks
+// from recent bulletins (drafts included — sometimes you want to
+// promote before the bulletin is fully published). Click any item to
+// open the composer pre-seeded with that content.
+// =====================================================================
+function AnnouncementFlow({ user, navigate, onBack }) {
+  const [loading, setLoading] = useState(true);
+  const [events, setEvents] = useState([]);
+  const [annoucementsByBulletin, setAnnouncementsByBulletin] = useState([]);
+  const [error, setError] = useState(null);
+  const [staged, setStaged] = useState(null); // → composer
+  const [polishing, setPolishing] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const today = new Date().toISOString().slice(0, 10);
+        const [evRes, blnRes, annRes, otherRes] = await Promise.all([
+          // Upcoming calendar events in the next 90 days.
+          withTimeout(
+            supabase
+              .from('calendar_events')
+              .select('id, event_date, event_time, title, location, notes, is_published')
+              .gte('event_date', today)
+              .order('event_date', { ascending: true })
+              .limit(40)
+          ),
+          // Recent bulletins (draft + published, not archived) so we can
+          // group their announcements + flyer blocks below.
+          withTimeout(
+            supabase
+              .from('bulletins')
+              .select('id, service_date, sunday_designation, status')
+              .in('status', ['draft', 'published'])
+              .order('service_date', { ascending: false })
+              .limit(8)
+          ),
+          withTimeout(
+            supabase
+              .from('announcements')
+              .select('id, bulletin_id, position, body')
+              .order('position', { ascending: true })
+          ),
+          withTimeout(
+            supabase
+              .from('other_blocks')
+              .select(
+                'id, bulletin_id, position, block_type, heading, body, image_url, signature'
+              )
+              .order('position', { ascending: true })
+          ),
+        ]);
+        if (evRes.error) throw evRes.error;
+        if (blnRes.error) throw blnRes.error;
+        if (annRes.error) throw annRes.error;
+        if (otherRes.error) throw otherRes.error;
+        if (cancelled) return;
+        setEvents(evRes.data ?? []);
+        // Group announcements + other_blocks under their bulletin.
+        const bulletinList = blnRes.data ?? [];
+        const blockedByBulletin = bulletinList
+          .map((b) => {
+            const announcements = (annRes.data ?? []).filter(
+              (a) => a.bulletin_id === b.id
+            );
+            const others = (otherRes.data ?? []).filter(
+              (o) => o.bulletin_id === b.id
+            );
+            return { bulletin: b, announcements, others };
+          })
+          .filter((g) => g.announcements.length + g.others.length > 0);
+        setAnnouncementsByBulletin(blockedByBulletin);
+      } catch (e) {
+        if (!cancelled) setError(e.message || String(e));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const stageEvent = (ev) => {
+    const dateStr = new Date(ev.event_date + 'T00:00:00').toLocaleDateString(
+      'en-US',
+      { weekday: 'long', month: 'long', day: 'numeric' }
+    );
+    const timeStr = ev.event_time
+      ? new Date(`1970-01-01T${ev.event_time}`).toLocaleTimeString('en-US', {
+          hour: 'numeric',
+          minute: '2-digit',
+        })
+      : null;
+    const lines = [ev.title];
+    lines.push(`${dateStr}${timeStr ? ` at ${timeStr}` : ''}`);
+    if (ev.location) lines.push(ev.location);
+    if (ev.notes) lines.push(`\n${ev.notes}`);
+    setStaged({
+      title: ev.title,
+      body: lines.join('\n'),
+      sourceBulletinId: null,
+      kind: 'event',
+    });
+  };
+
+  const stageAnnouncement = (group, ann) => {
+    setStaged({
+      title: `Announcement · ${
+        group.bulletin.sunday_designation || group.bulletin.service_date
+      }`,
+      body: ann.body,
+      sourceBulletinId: group.bulletin.id,
+      kind: 'announcement',
+    });
+  };
+
+  const stageOtherBlock = (group, blk) => {
+    const lines = [];
+    if (blk.heading) lines.push(blk.heading);
+    if (blk.body) lines.push(blk.body);
+    if (blk.signature) lines.push(`\n— ${blk.signature}`);
+    setStaged({
+      title: blk.heading || `Bulletin item · ${group.bulletin.service_date}`,
+      body: lines.join('\n'),
+      sourceBulletinId: group.bulletin.id,
+      kind: blk.block_type,
+      imageUrl: blk.image_url || null,
+    });
+  };
+
+  const polishWithClaude = async () => {
+    if (!staged) return;
+    setPolishing(true);
+    setError(null);
+    try {
+      const polished = await draftFreeForm({ prompt: staged.body });
+      setStaged((s) => ({
+        ...s,
+        title: polished.title || s.title,
+        body: polished.body || s.body,
+      }));
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setPolishing(false);
+    }
+  };
+
+  const save = async () => {
+    if (!user?.id || !staged) return;
+    if (!staged.body.trim()) {
+      setError('Add some post text before saving.');
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const { data: created, error: err } = await withTimeout(
+        supabase
+          .from('social_posts')
+          .insert({
+            owner_user_id: user.id,
+            status: 'draft',
+            title: staged.title.trim() || null,
+            body: staged.body.trim(),
+            source_type: 'manual',
+            source_bulletin_id: staged.sourceBulletinId ?? null,
+          })
+          .select()
+          .single()
+      );
+      if (err) throw err;
+
+      // If the source had an image (e.g., a flyer block), copy it over.
+      if (staged.imageUrl) {
+        try {
+          const res = await fetch(staged.imageUrl);
+          if (res.ok) {
+            const blob = await res.blob();
+            const ext = (blob.type.split('/')[1] || 'jpg').replace(
+              'jpeg',
+              'jpg'
+            );
+            const path = `${user.id}/${created.id}/${Date.now()}.${ext}`;
+            const { error: upErr } = await supabase.storage
+              .from('social-images')
+              .upload(path, blob, {
+                cacheControl: '3600',
+                upsert: false,
+                contentType: blob.type || `image/${ext}`,
+              });
+            if (!upErr) {
+              await supabase
+                .from('social_posts')
+                .update({ image_path: path })
+                .eq('id', created.id);
+            }
+          }
+        } catch (imgErr) {
+          // eslint-disable-next-line no-console
+          console.warn('Failed to copy source image:', imgErr);
+        }
+      }
+
+      navigate(`/posts/${created.id}`);
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (staged) {
+    return (
+      <div className="card space-y-3">
+        <div className="flex items-center justify-between">
+          <h2 className="font-serif text-lg text-umc-900">Composer</h2>
+          <button
+            type="button"
+            onClick={() => setStaged(null)}
+            className="text-xs text-gray-500 hover:text-gray-700 underline"
+          >
+            ← Pick a different item
+          </button>
+        </div>
+        <div>
+          <label className="label">Title (internal)</label>
+          <input
+            type="text"
+            className="input"
+            value={staged.title}
+            onChange={(e) => setStaged({ ...staged, title: e.target.value })}
+          />
+        </div>
+        <div>
+          <label className="label">Post text *</label>
+          <textarea
+            className="input min-h-[200px] font-mono text-sm"
+            value={staged.body}
+            onChange={(e) => setStaged({ ...staged, body: e.target.value })}
+          />
+        </div>
+        {staged.imageUrl && (
+          <div className="text-xs text-gray-500 flex items-center gap-2">
+            <img
+              src={staged.imageUrl}
+              alt=""
+              className="h-12 w-12 object-cover rounded"
+            />
+            <span>The flyer image will be attached to the post.</span>
+          </div>
+        )}
+        <div className="border border-dashed border-gray-300 rounded p-2 bg-gray-50 flex items-center justify-between gap-2">
+          <p className="text-xs text-gray-600">
+            Want Claude to polish this into posting voice?
+          </p>
+          <button
+            type="button"
+            onClick={polishWithClaude}
+            disabled={polishing || !staged.body.trim()}
+            className="btn-secondary text-xs disabled:opacity-50"
+          >
+            {polishing ? 'Polishing…' : '✨ Polish with Claude'}
+          </button>
+        </div>
+        {error && (
+          <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded px-3 py-2">
+            {error}
+          </p>
+        )}
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={save}
+            disabled={busy}
+            className="btn-primary disabled:opacity-50"
+          >
+            {busy ? 'Saving…' : 'Save as draft'}
+          </button>
+          <Link to="/" className="btn-secondary">
+            Cancel
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  if (loading) return <LoadingSpinner label="Loading events + announcements…" />;
+
+  return (
+    <div className="space-y-3">
+      <div className="card">
+        <div className="flex items-center justify-between">
+          <h2 className="font-serif text-lg text-umc-900">
+            From announcement / event
+          </h2>
+          <button
+            type="button"
+            onClick={onBack}
+            className="text-xs text-gray-500 hover:text-gray-700 underline"
+          >
+            ← Pick a different source
+          </button>
+        </div>
+        <p className="text-xs text-gray-500 mt-1">
+          Click any item to start a draft. Bulletins still in draft status
+          are included so you can promote upcoming things.
+        </p>
+        {error && <p className="text-sm text-red-600 mt-2">{error}</p>}
+      </div>
+
+      {events.length > 0 && (
+        <div className="card">
+          <h3 className="font-serif text-base text-umc-900">
+            Upcoming calendar events
+            <span className="ml-2 text-xs font-normal text-gray-500">
+              ({events.length})
+            </span>
+          </h3>
+          <ul className="mt-2 divide-y divide-gray-100">
+            {events.map((ev) => (
+              <li key={ev.id}>
+                <button
+                  type="button"
+                  onClick={() => stageEvent(ev)}
+                  className="w-full text-left py-2 hover:bg-gray-50 px-2 rounded"
+                >
+                  <div className="flex items-baseline justify-between gap-2">
+                    <span className="text-sm font-medium text-umc-900">
+                      {ev.title}
+                    </span>
+                    <span className="text-xs text-gray-500 whitespace-nowrap">
+                      {new Date(ev.event_date + 'T00:00:00').toLocaleDateString(
+                        'en-US',
+                        { month: 'short', day: 'numeric' }
+                      )}
+                      {ev.event_time && ` · ${ev.event_time.slice(0, 5)}`}
+                    </span>
+                  </div>
+                  {ev.location && (
+                    <p className="text-xs text-gray-500">{ev.location}</p>
+                  )}
+                  {ev.notes && (
+                    <p className="text-xs text-gray-600 line-clamp-2 mt-1">
+                      {ev.notes}
+                    </p>
+                  )}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {annoucementsByBulletin.length > 0 && (
+        <div className="card">
+          <h3 className="font-serif text-base text-umc-900">
+            Bulletin announcements + flyers
+          </h3>
+          <p className="text-xs text-gray-500 mt-0.5 mb-3">
+            Includes draft bulletins so you can promote ahead of publishing.
+          </p>
+          <ul className="space-y-3">
+            {annoucementsByBulletin.map((g) => (
+              <li
+                key={g.bulletin.id}
+                className="border border-gray-200 rounded p-3"
+              >
+                <p className="text-xs uppercase tracking-wide text-gray-500 mb-2">
+                  {g.bulletin.sunday_designation || g.bulletin.service_date}
+                  {g.bulletin.status === 'draft' && (
+                    <span className="ml-2 text-amber-700 normal-case">
+                      (draft)
+                    </span>
+                  )}
+                </p>
+                <ul className="space-y-1">
+                  {g.announcements.map((a) => (
+                    <li key={a.id}>
+                      <button
+                        type="button"
+                        onClick={() => stageAnnouncement(g, a)}
+                        className="w-full text-left py-1 px-2 hover:bg-gray-50 rounded text-sm text-gray-700 line-clamp-2"
+                      >
+                        📣 {a.body}
+                      </button>
+                    </li>
+                  ))}
+                  {g.others.map((o) => (
+                    <li key={o.id}>
+                      <button
+                        type="button"
+                        onClick={() => stageOtherBlock(g, o)}
+                        className="w-full text-left py-1 px-2 hover:bg-gray-50 rounded text-sm text-gray-700"
+                      >
+                        {o.block_type === 'image_flyer' && '🖼️ '}
+                        {o.block_type === 'personal_note' && '✉️ '}
+                        {o.block_type === 'heading_body' && '📋 '}
+                        {o.heading || o.body?.slice(0, 80) || '(untitled)'}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {events.length === 0 && annoucementsByBulletin.length === 0 && (
+        <p className="card text-sm text-gray-500 text-center py-6">
+          No upcoming events or recent bulletin announcements found.
+        </p>
+      )}
     </div>
   );
 }
