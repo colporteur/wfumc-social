@@ -6,6 +6,7 @@ import PostList from './pages/PostList.jsx';
 import PostNew from './pages/PostNew.jsx';
 import PostDetail from './pages/PostDetail.jsx';
 import Channels from './pages/Channels.jsx';
+import Prompts from './pages/Prompts.jsx';
 
 export default function App() {
   return (
@@ -22,6 +23,7 @@ export default function App() {
         <Route path="/posts/new" element={<PostNew />} />
         <Route path="/posts/:id" element={<PostDetail />} />
         <Route path="/channels" element={<Channels />} />
+        <Route path="/prompts" element={<Prompts />} />
       </Route>
       <Route path="*" element={<NotFound />} />
     </Routes>
