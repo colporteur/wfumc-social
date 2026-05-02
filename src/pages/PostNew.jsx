@@ -4,7 +4,6 @@ import { supabase, withTimeout } from '../lib/supabase';
 import {
   draftFreeForm,
   draftFromImage,
-  draftFromResponsePrompt,
   draftFromSermon,
 } from '../lib/claude';
 import { uploadPostImage } from '../lib/postImages';
@@ -20,9 +19,9 @@ const SOURCES = [
   },
   {
     value: 'response_prompt',
-    label: 'From bulletin response prompt',
-    icon: '📋',
-    blurb: 'Pick a recent bulletin; Claude drafts from its response prompt.',
+    label: 'From worshipper submissions',
+    icon: '🙋',
+    blurb: 'Browse responses, photos, and highlights worshippers sent in for a bulletin. Pick one to seed your post.',
   },
   {
     value: 'sermon',
@@ -77,7 +76,7 @@ export default function PostNew() {
         <FreeFormFlow user={user} navigate={navigate} onBack={() => setSource(null)} />
       )}
       {source === 'response_prompt' && (
-        <ResponsePromptFlow user={user} navigate={navigate} onBack={() => setSource(null)} />
+        <SubmissionsFlow user={user} navigate={navigate} onBack={() => setSource(null)} />
       )}
       {source === 'sermon' && (
         <SermonFlow user={user} navigate={navigate} onBack={() => setSource(null)} />
@@ -301,21 +300,27 @@ function FreeFormFlow({ user, navigate, onBack }) {
 }
 
 // =====================================================================
-// Response-prompt flow: pick a published bulletin with a response prompt
+// Submissions flow: pick a bulletin → browse worshipper submissions
+// (text responses, photos, highlights) → pick one to seed the composer
+// with that submission's content.
 // =====================================================================
-function ResponsePromptFlow({ user, navigate, onBack }) {
-  const [loading, setLoading] = useState(true);
+function SubmissionsFlow({ user, navigate, onBack }) {
+  const [loadingBulletins, setLoadingBulletins] = useState(true);
   const [bulletins, setBulletins] = useState([]);
   const [picked, setPicked] = useState(null);
-  const [drafted, setDrafted] = useState(null);
-  const [drafting, setDrafting] = useState(false);
-  const [busy, setBusy] = useState(false);
+  const [loadingSubs, setLoadingSubs] = useState(false);
+  const [submissions, setSubmissions] = useState([]);
   const [error, setError] = useState(null);
+  const [chosenSub, setChosenSub] = useState(null); // → composer
+  const [busy, setBusy] = useState(false);
 
+  // Load recent bulletins. Show ALL bulletins (not just those with a
+  // response prompt) — worshippers can submit highlights from any
+  // bulletin even if there's no prompt.
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      setLoading(true);
+      setLoadingBulletins(true);
       try {
         const { data, error: err } = await withTimeout(
           supabase
@@ -323,7 +328,6 @@ function ResponsePromptFlow({ user, navigate, onBack }) {
             .select(
               'id, service_date, sunday_designation, status, response_prompt'
             )
-            .not('response_prompt', 'is', null)
             .order('service_date', { ascending: false })
             .limit(30)
         );
@@ -333,7 +337,7 @@ function ResponsePromptFlow({ user, navigate, onBack }) {
       } catch (e) {
         if (!cancelled) setError(e.message || String(e));
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) setLoadingBulletins(false);
       }
     })();
     return () => {
@@ -341,68 +345,86 @@ function ResponsePromptFlow({ user, navigate, onBack }) {
     };
   }, []);
 
-  const runDraft = async () => {
-    if (!picked) return;
-    setDrafting(true);
-    setError(null);
-    try {
-      // Pull adjacent sermon info if we can find one for the bulletin.
-      let sermon = null;
+  // Load submissions whenever picked changes.
+  useEffect(() => {
+    if (!picked) {
+      setSubmissions([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      setLoadingSubs(true);
+      setError(null);
       try {
-        const { data: liturgyRow } = await withTimeout(
+        const { data, error: err } = await withTimeout(
           supabase
-            .from('liturgy_items')
+            .from('responses')
             .select(
-              'sermon_id, sermon:sermons(title, scripture_reference)'
+              'id, is_anonymous, submitter_name, response_text, caption, image_url, highlighted_text, source_label, used_in_social_media, submitted_at'
             )
             .eq('bulletin_id', picked.id)
-            .not('sermon_id', 'is', null)
-            .limit(1)
-            .maybeSingle()
+            .order('submitted_at', { ascending: false })
         );
-        sermon = liturgyRow?.sermon ?? null;
-      } catch {
-        /* harmless — just no sermon context */
+        if (err) throw err;
+        if (cancelled) return;
+        setSubmissions(data ?? []);
+      } catch (e) {
+        if (!cancelled) setError(e.message || String(e));
+      } finally {
+        if (!cancelled) setLoadingSubs(false);
       }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [picked]);
 
-      const result = await draftFromResponsePrompt({
-        responsePrompt: picked.response_prompt,
-        bulletinDesignation: picked.sunday_designation,
-        serviceDate: picked.service_date,
-        sermonTitle: sermon?.title,
-        scriptureRef: sermon?.scripture_reference,
-      });
-      setDrafted(result);
-    } catch (e) {
-      setError(e.message || String(e));
-    } finally {
-      setDrafting(false);
+  if (chosenSub) {
+    // Build composer initial values from the submission.
+    const sub = chosenSub;
+    const attribution = sub.is_anonymous
+      ? 'Submitted anonymously'
+      : sub.submitter_name
+        ? `Submitted by ${sub.submitter_name}`
+        : 'Submitted by a worshipper';
+    let initialBody = '';
+    if (sub.highlighted_text) {
+      // Highlight: lead with the snippet, follow with optional commentary.
+      initialBody = `"${sub.highlighted_text}"`;
+      if (sub.source_label) initialBody += `\n— from ${sub.source_label}`;
+      if (sub.response_text) {
+        initialBody += `\n\n${sub.response_text}`;
+      }
+    } else if (sub.response_text) {
+      initialBody = sub.response_text;
+    } else if (sub.caption) {
+      initialBody = sub.caption;
     }
-  };
+    const initialTitle = `${picked.sunday_designation || picked.service_date} · ${attribution}`;
 
-  if (drafted) {
     return (
-      <Composer
+      <SubmissionComposer
         user={user}
         navigate={navigate}
-        initialTitle={drafted.title}
-        initialBody={drafted.body}
-        sourceType="response_prompt"
+        initialTitle={initialTitle}
+        initialBody={initialBody}
         sourceBulletinId={picked.id}
-        onBack={() => setDrafted(null)}
+        responseId={sub.id}
+        existingImageUrl={sub.image_url}
+        onBack={() => setChosenSub(null)}
         busy={busy}
         setBusy={setBusy}
       />
     );
   }
 
-  if (loading) return <LoadingSpinner label="Loading bulletins…" />;
+  if (loadingBulletins) return <LoadingSpinner label="Loading bulletins…" />;
 
   return (
     <div className="card space-y-3">
       <div className="flex items-center justify-between">
         <h2 className="font-serif text-lg text-umc-900">
-          From bulletin response prompt
+          From worshipper submissions
         </h2>
         <button
           type="button"
@@ -412,11 +434,9 @@ function ResponsePromptFlow({ user, navigate, onBack }) {
           ← Pick a different source
         </button>
       </div>
+
       {bulletins.length === 0 ? (
-        <p className="text-sm text-gray-500">
-          No bulletins found with a response prompt. Add one in the Bulletin
-          admin first.
-        </p>
+        <p className="text-sm text-gray-500">No bulletins found.</p>
       ) : (
         <>
           <div>
@@ -437,29 +457,291 @@ function ResponsePromptFlow({ user, navigate, onBack }) {
               ))}
             </select>
           </div>
-          {picked && (
+
+          {picked?.response_prompt && (
             <div className="bg-gray-50 border border-gray-200 rounded p-3">
               <p className="text-xs uppercase tracking-wide text-gray-500 mb-1">
-                Response prompt
+                This week's prompt
               </p>
-              <p className="text-sm text-gray-700 whitespace-pre-wrap">
-                {picked.response_prompt}
+              <p className="text-sm italic text-gray-700 whitespace-pre-wrap">
+                "{picked.response_prompt}"
               </p>
             </div>
           )}
+
           {error && <p className="text-sm text-red-600">{error}</p>}
-          <div className="flex gap-2">
-            <button
-              type="button"
-              onClick={runDraft}
-              disabled={!picked || drafting}
-              className="btn-primary disabled:opacity-50"
-            >
-              {drafting ? 'Drafting…' : '✨ Draft with Claude'}
-            </button>
-          </div>
+
+          {picked && (
+            <SubmissionsList
+              loading={loadingSubs}
+              submissions={submissions}
+              onPick={setChosenSub}
+            />
+          )}
         </>
       )}
+    </div>
+  );
+}
+
+function SubmissionsList({ loading, submissions, onPick }) {
+  if (loading) return <LoadingSpinner label="Loading submissions…" />;
+  if (submissions.length === 0) {
+    return (
+      <p className="text-sm text-gray-500 text-center py-6">
+        No submissions for this bulletin yet.
+      </p>
+    );
+  }
+  return (
+    <ul className="space-y-2">
+      {submissions.map((s) => {
+        const kind = s.highlighted_text
+          ? 'highlight'
+          : s.image_url
+            ? 'photo'
+            : 'response';
+        const KIND_BADGE = {
+          highlight: { label: 'Highlight', cls: 'bg-amber-100 text-amber-800' },
+          photo: { label: 'Photo', cls: 'bg-pink-100 text-pink-800' },
+          response: { label: 'Response', cls: 'bg-blue-100 text-blue-800' },
+        };
+        const badge = KIND_BADGE[kind];
+        const who = s.is_anonymous
+          ? 'Anonymous'
+          : s.submitter_name || 'Unnamed';
+        return (
+          <li key={s.id}>
+            <button
+              type="button"
+              onClick={() => onPick(s)}
+              className="w-full text-left card hover:border-umc-700 transition-colors p-3"
+            >
+              <div className="flex items-baseline gap-2 flex-wrap">
+                <span
+                  className={`px-2 py-0.5 text-[10px] uppercase tracking-wide rounded ${badge.cls}`}
+                >
+                  {badge.label}
+                </span>
+                <span className="text-xs text-gray-500">— {who}</span>
+                {s.used_in_social_media && (
+                  <span className="text-[10px] uppercase tracking-wide text-green-700">
+                    used
+                  </span>
+                )}
+                <span className="text-[10px] text-gray-400 ml-auto">
+                  {new Date(s.submitted_at).toLocaleDateString()}
+                </span>
+              </div>
+              <div className="mt-2 flex gap-3">
+                {s.image_url && (
+                  <img
+                    src={s.image_url}
+                    alt=""
+                    loading="lazy"
+                    className="h-16 w-16 object-cover rounded shrink-0 bg-gray-100"
+                  />
+                )}
+                <div className="min-w-0 flex-1 space-y-1">
+                  {s.highlighted_text && (
+                    <p className="text-sm italic text-gray-800 line-clamp-3 border-l-2 border-umc-300 pl-2">
+                      "{s.highlighted_text}"
+                    </p>
+                  )}
+                  {s.source_label && s.highlighted_text && (
+                    <p className="text-[10px] text-gray-500">
+                      from {s.source_label}
+                    </p>
+                  )}
+                  {s.response_text && (
+                    <p className="text-sm text-gray-700 line-clamp-3 whitespace-pre-wrap">
+                      {s.response_text}
+                    </p>
+                  )}
+                  {s.caption && !s.response_text && (
+                    <p className="text-sm text-gray-700 line-clamp-2">
+                      {s.caption}
+                    </p>
+                  )}
+                </div>
+              </div>
+            </button>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+// Variant of Composer that, on save, also marks the source response
+// as used_in_social_media. Optionally seeds the post's image from the
+// worshipper's uploaded photo (downloads + re-uploads to social bucket
+// so the post owns its own copy).
+function SubmissionComposer({
+  user,
+  navigate,
+  initialTitle,
+  initialBody,
+  sourceBulletinId,
+  responseId,
+  existingImageUrl,
+  onBack,
+  busy,
+  setBusy,
+}) {
+  const [title, setTitle] = useState(initialTitle || '');
+  const [body, setBody] = useState(initialBody || '');
+  const [keepImage, setKeepImage] = useState(!!existingImageUrl);
+  const [error, setError] = useState(null);
+
+  const save = async () => {
+    if (!user?.id) return;
+    if (!body.trim()) {
+      setError('Add some post text before saving.');
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      // Insert the post first — image attach is a follow-up update so
+      // we have the post id for the storage path.
+      const { data: created, error: err } = await withTimeout(
+        supabase
+          .from('social_posts')
+          .insert({
+            owner_user_id: user.id,
+            status: 'draft',
+            title: title.trim() || null,
+            body: body.trim(),
+            source_type: 'response_prompt',
+            source_bulletin_id: sourceBulletinId,
+          })
+          .select()
+          .single()
+      );
+      if (err) throw err;
+
+      // Bring the worshipper's photo over to the post.
+      if (keepImage && existingImageUrl) {
+        try {
+          const res = await fetch(existingImageUrl);
+          if (res.ok) {
+            const blob = await res.blob();
+            const ext =
+              (blob.type.split('/')[1] || 'jpg').replace('jpeg', 'jpg');
+            const path = `${user.id}/${created.id}/${Date.now()}.${ext}`;
+            const { error: upErr } = await supabase.storage
+              .from('social-images')
+              .upload(path, blob, {
+                cacheControl: '3600',
+                upsert: false,
+                contentType: blob.type || `image/${ext}`,
+              });
+            if (!upErr) {
+              await supabase
+                .from('social_posts')
+                .update({ image_path: path })
+                .eq('id', created.id);
+            }
+          }
+        } catch (imgErr) {
+          // Non-fatal: post still saves without image.
+          // eslint-disable-next-line no-console
+          console.warn('Failed to copy submission image:', imgErr);
+        }
+      }
+
+      // Mark the source submission as used.
+      try {
+        await supabase
+          .from('responses')
+          .update({ used_in_social_media: true })
+          .eq('id', responseId);
+      } catch (markErr) {
+        // eslint-disable-next-line no-console
+        console.warn('Failed to mark response used:', markErr);
+      }
+
+      navigate(`/posts/${created.id}`);
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="card space-y-3">
+      <div className="flex items-center justify-between">
+        <h2 className="font-serif text-lg text-umc-900">Composer</h2>
+        <button
+          type="button"
+          onClick={onBack}
+          className="text-xs text-gray-500 hover:text-gray-700 underline"
+        >
+          ← Back to submissions
+        </button>
+      </div>
+      <div>
+        <label className="label">Title (internal)</label>
+        <input
+          type="text"
+          className="input"
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+        />
+      </div>
+      <div>
+        <label className="label">Post text *</label>
+        <textarea
+          className="input min-h-[200px] font-mono text-sm"
+          value={body}
+          onChange={(e) => setBody(e.target.value)}
+        />
+      </div>
+      {existingImageUrl && (
+        <div className="border border-gray-200 rounded p-3 bg-gray-50">
+          <div className="flex items-start gap-3">
+            <img
+              src={existingImageUrl}
+              alt=""
+              className="h-24 w-24 object-cover rounded shrink-0"
+            />
+            <div className="flex-1">
+              <p className="text-xs text-gray-600 mb-2">
+                The worshipper attached this photo. Keep it on your post?
+              </p>
+              <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={keepImage}
+                  onChange={(e) => setKeepImage(e.target.checked)}
+                  className="h-4 w-4 rounded border-gray-300 text-umc-700"
+                />
+                Use this photo
+              </label>
+            </div>
+          </div>
+        </div>
+      )}
+      {error && (
+        <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded px-3 py-2">
+          {error}
+        </p>
+      )}
+      <div className="flex gap-2">
+        <button
+          type="button"
+          onClick={save}
+          disabled={busy}
+          className="btn-primary disabled:opacity-50"
+        >
+          {busy ? 'Saving…' : 'Save as draft'}
+        </button>
+        <Link to="/" className="btn-secondary">
+          Cancel
+        </Link>
+      </div>
     </div>
   );
 }

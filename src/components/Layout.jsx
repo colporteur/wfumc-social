@@ -22,6 +22,12 @@ export default function Layout() {
           </Link>
           {session && (
             <div className="flex items-center gap-3 sm:gap-4 text-sm">
+              <Link
+                to="/channels"
+                className="text-umc-100 hover:text-white underline whitespace-nowrap"
+              >
+                Channels
+              </Link>
               <span className="text-umc-100 hidden sm:inline">
                 {profile?.full_name}
               </span>

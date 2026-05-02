@@ -5,6 +5,7 @@ import Login from './pages/Login.jsx';
 import PostList from './pages/PostList.jsx';
 import PostNew from './pages/PostNew.jsx';
 import PostDetail from './pages/PostDetail.jsx';
+import Channels from './pages/Channels.jsx';
 
 export default function App() {
   return (
@@ -20,6 +21,7 @@ export default function App() {
         <Route path="/" element={<PostList />} />
         <Route path="/posts/new" element={<PostNew />} />
         <Route path="/posts/:id" element={<PostDetail />} />
+        <Route path="/channels" element={<Channels />} />
       </Route>
       <Route path="*" element={<NotFound />} />
     </Routes>

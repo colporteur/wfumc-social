@@ -6,6 +6,7 @@ import {
   uploadPostImage,
   deletePostImage,
 } from '../lib/postImages';
+import ChannelChips from '../components/ChannelChips.jsx';
 import LoadingSpinner from '../components/LoadingSpinner.jsx';
 import { useAuth } from '../contexts/AuthContext.jsx';
 
@@ -15,8 +16,6 @@ const STATUS_BADGE = {
   posted:   { label: 'Posted',   cls: 'bg-green-100 text-green-800' },
   archived: { label: 'Archived', cls: 'bg-gray-100 text-gray-500' },
 };
-
-const COMMON_PLATFORMS = ['Facebook', 'Instagram', 'X', 'YouTube', 'Email'];
 
 const SOURCE_LABEL = {
   manual: 'Manual',
@@ -126,14 +125,6 @@ export default function PostDetail() {
     setImageFile(null);
   };
 
-  const togglePlatform = (p) => {
-    setDraft((d) => ({
-      ...d,
-      platforms: d.platforms.includes(p)
-        ? d.platforms.filter((x) => x !== p)
-        : [...d.platforms, p],
-    }));
-  };
 
   const save = async () => {
     if (!draft) return;
@@ -373,26 +364,11 @@ export default function PostDetail() {
               </div>
             </div>
             <div>
-              <label className="label">Platforms</label>
-              <div className="flex flex-wrap gap-2">
-                {COMMON_PLATFORMS.map((p) => {
-                  const on = draft.platforms.includes(p);
-                  return (
-                    <button
-                      key={p}
-                      type="button"
-                      onClick={() => togglePlatform(p)}
-                      className={`px-3 py-1 text-sm rounded border ${
-                        on
-                          ? 'bg-umc-700 text-white border-umc-700'
-                          : 'bg-white text-gray-700 border-gray-300 hover:border-gray-400'
-                      }`}
-                    >
-                      {p}
-                    </button>
-                  );
-                })}
-              </div>
+              <label className="label">Channels</label>
+              <ChannelChips
+                value={draft.platforms}
+                onChange={(next) => setDraft({ ...draft, platforms: next })}
+              />
             </div>
             <div>
               <label className="label">Image</label>
