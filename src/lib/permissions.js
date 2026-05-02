@@ -10,6 +10,7 @@ export const ROLE_LABELS = {
   music_director: 'Music Director',
   treasurer: 'Treasurer',
   social_media: 'Social Media Team',
+  worship_team: 'Worship Team',
   pianist: 'Pianist',
   staff: 'Staff',
 };
