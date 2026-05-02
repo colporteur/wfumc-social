@@ -160,6 +160,8 @@ export default function PostList() {
         navigate={navigate}
       />
 
+      <UpcomingWorshipPlans />
+
       <div className="card space-y-3">
         <div>
           <label className="label">Search</label>
@@ -449,6 +451,118 @@ function LatestBulletinSubmissions({ userId, navigate }) {
           compactHeader
         />
       </div>
+    </div>
+  );
+}
+
+// Phase-3 surface: upcoming weeks of worship plans (selected scripture
+// + theme) so the social media team can plan content around what the
+// pastor + worship team are preparing for. Read-only — clicking a week
+// just opens "+ New post" with the scripture/theme prefilled, but for
+// now we link to /posts/new and let the user start fresh.
+function UpcomingWorshipPlans() {
+  const [loading, setLoading] = useState(true);
+  const [plans, setPlans] = useState([]);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const today = new Date().toISOString().slice(0, 10);
+        const { data, error: err } = await withTimeout(
+          supabase
+            .from('worship_plans')
+            .select(
+              'service_date, scripture_reference, theme, sermon_topic, lectionary_designation, liturgical_season, text_source'
+            )
+            .gte('service_date', today)
+            .order('service_date', { ascending: true })
+            .limit(8)
+        );
+        if (err) throw err;
+        if (!cancelled) setPlans(data ?? []);
+      } catch (e) {
+        if (!cancelled) setError(e.message || String(e));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (loading) {
+    return (
+      <div className="card text-sm text-gray-500">
+        Loading upcoming worship plans…
+      </div>
+    );
+  }
+  if (error) {
+    // Worship plans table may not exist on older deploys — render nothing
+    // rather than blocking the page.
+    return null;
+  }
+  if (plans.length === 0) return null;
+
+  // Only show plans that have either text or theme — the others are
+  // upcoming Sundays the pastor hasn't planned yet.
+  const meaningful = plans.filter(
+    (p) => p.scripture_reference || p.theme || p.sermon_topic
+  );
+  if (meaningful.length === 0) return null;
+
+  return (
+    <div className="card">
+      <div className="flex items-baseline justify-between gap-2 flex-wrap">
+        <div>
+          <h2 className="font-serif text-base text-umc-900">
+            Upcoming worship
+          </h2>
+          <p className="text-xs text-gray-500 mt-0.5">
+            What the pastor is planning to preach. Use as inspiration for posts.
+          </p>
+        </div>
+      </div>
+      <ul className="mt-3 space-y-2">
+        {meaningful.slice(0, 4).map((p) => (
+          <li
+            key={p.service_date}
+            className="flex items-baseline justify-between gap-3 py-1 border-b border-gray-100 last:border-b-0"
+          >
+            <div className="min-w-0">
+              <p className="text-sm">
+                <span className="font-medium text-umc-900">
+                  {p.lectionary_designation || p.service_date}
+                </span>
+                {p.lectionary_designation && (
+                  <span className="text-xs text-gray-500 ml-2">
+                    {p.service_date}
+                  </span>
+                )}
+              </p>
+              {p.theme && (
+                <p className="text-xs text-umc-700 mt-0.5">Theme: {p.theme}</p>
+              )}
+              {p.sermon_topic && (
+                <p className="text-xs text-gray-700 mt-0.5">{p.sermon_topic}</p>
+              )}
+              {p.scripture_reference && (
+                <p className="text-xs text-gray-500 mt-0.5">
+                  {p.scripture_reference}
+                  {p.text_source === 'off_lectionary' && (
+                    <span className="ml-1 text-amber-700">· off-lectionary</span>
+                  )}
+                </p>
+              )}
+            </div>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
